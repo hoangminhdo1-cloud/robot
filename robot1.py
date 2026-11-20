@@ -1,335 +1,412 @@
-from machine import Pin, PWM
-from time import sleep, sleep_us
+import time
+import sys
+import struct
 
-# ==========================================
-# 1. CAU HINH TAY CAM PS2
-# ==========================================
+# MicroPython provides these modules only on the ESP32.
+try:
+    from machine import Pin, PWM  # pyright: ignore[reportMissingImports]
+    import bluetooth  # pyright: ignore[reportMissingImports]
+except ImportError:
+    HARDWARE_AVAILABLE = False
+else:
+    HARDWARE_AVAILABLE = (
+        sys.implementation.name == "micropython" and sys.platform == "esp32"
+    )
 
-PS2_DAT = Pin(12, Pin.IN, Pin.PULL_UP)
-PS2_CMD = Pin(13, Pin.OUT, value=1)
-PS2_CLK = Pin(14, Pin.OUT, value=1)
-PS2_ATT = Pin(15, Pin.OUT, value=1)
+BLE_NAME = "Robot-S3"
+PACKET_MAGIC = 0xA7
+PACKET_FORMAT = "<BhhhH"
+PACKET_SIZE = struct.calcsize(PACKET_FORMAT)
+CONTROL_TIMEOUT_MS = 500
 
+BUTTON_LIFT = 1 << 0
+BUTTON_LOWER = 1 << 1
+BUTTON_GRIP = 1 << 2
+BUTTON_RELEASE = 1 << 3
+BUTTON_LIGHT = 1 << 4
+BUTTON_PICK = 1 << 5
+BUTTON_DROP = 1 << 6
+BUTTON_RESET = 1 << 7
 
-def ps2_transfer(data):
-    received = 0
-
-    for i in range(8):
-        PS2_CLK.value(1)
-        PS2_CMD.value((data >> i) & 1)
-        sleep_us(10)
-
-        PS2_CLK.value(0)
-        sleep_us(10)
-
-        received |= PS2_DAT.value() << i
-
-    PS2_CLK.value(1)
-    return received
-
-
-def ps2_read():
-    PS2_ATT.value(0)
-    sleep_us(20)
-
-    ps2_transfer(0x01)
-    mode = ps2_transfer(0x42)
-    ps2_transfer(0x00)
-
-    data = []
-    for i in range(6):
-        data.append(ps2_transfer(0x00))
-
-    PS2_ATT.value(1)
-
-    if mode not in (0x41, 0x73, 0x79):
-        return None
-
-    # O che do digital khong co gia tri can analog.
-    if mode == 0x41:
-        data[2] = 128
-        data[3] = 128
-        data[4] = 128
-        data[5] = 128
-
-    return data
+_BLE_IRQ_CENTRAL_CONNECT = 1
+_BLE_IRQ_CENTRAL_DISCONNECT = 2
+_BLE_IRQ_GATTS_WRITE = 3
+_BLE_FLAG_WRITE = 0x0008
 
 
-def ps2_config():
-    PS2_ATT.value(0)
+def _write_pwm_duty(pwm, duty: int):
+    duty = max(0, min(1023, int(duty)))
+    duty_u16 = getattr(pwm, "duty_u16", None)
+    if duty_u16 is not None:
+        duty_u16(duty * 65535 // 1023)
+    else:
+        pwm.duty(duty)
 
-    ps2_transfer(0x01)
-    ps2_transfer(0x43)
-    ps2_transfer(0x00)
+#servo đây
+class BLEControlServer:
+    def __init__(self):
+        self.ble = bluetooth.BLE()
+        self.ble.active(True)
+        self.ble.config(gap_name=BLE_NAME)
+        self.ble.irq(self._irq)
+        services = (
+            (
+                bluetooth.UUID(0xFFF0),
+                ((bluetooth.UUID(0xFFF1), _BLE_FLAG_WRITE),),
+            ),
+        )
+        handles = self.ble.gatts_register_services(services)
+        self.value_handle = handles[0][0]
+        self.pending_packet = None
+        self.connected = False
+        self._advertise()
 
-    for value in [0x01, 0x00, 0x00, 0x00, 0x00]:
-        ps2_transfer(value)
+    def _advertise(self):
+        name = BLE_NAME.encode()
+        adv_data = bytes((2, 0x01, 0x06, len(name) + 1, 0x09)) + name
+        self.ble.gap_advertise(100000, adv_data=adv_data)
 
-    PS2_ATT.value(1)
-    sleep(0.01)
+    def _irq(self, event, data):
+        if event == _BLE_IRQ_CENTRAL_CONNECT:
+            self.connected = True
+        elif event == _BLE_IRQ_CENTRAL_DISCONNECT:
+            self.connected = False
+            self.pending_packet = None
+            self._advertise()
+        elif event == _BLE_IRQ_GATTS_WRITE:
+            _, value_handle = data
+            if value_handle == self.value_handle:
+                self.pending_packet = bytes(self.ble.gatts_read(value_handle))
 
-    PS2_ATT.value(0)
-
-    ps2_transfer(0x01)
-    ps2_transfer(0x44)
-    ps2_transfer(0x00)
-    ps2_transfer(0x01)
-    ps2_transfer(0x03)
-
-    for i in range(3):
-        ps2_transfer(0x00)
-
-    PS2_ATT.value(1)
-    sleep(0.01)
-
-    PS2_ATT.value(0)
-
-    ps2_transfer(0x01)
-    ps2_transfer(0x4F)
-    ps2_transfer(0x00)
-    ps2_transfer(0xFF)
-    ps2_transfer(0xFF)
-    ps2_transfer(0x03)
-    ps2_transfer(0x00)
-    ps2_transfer(0x00)
-
-    PS2_ATT.value(1)
-    sleep(0.01)
-
-    PS2_ATT.value(0)
-
-    ps2_transfer(0x01)
-    ps2_transfer(0x43)
-    ps2_transfer(0x00)
-    ps2_transfer(0x00)
-    ps2_transfer(0x00)
-    ps2_transfer(0x00)
-    ps2_transfer(0x00)
-    ps2_transfer(0x00)
-
-    PS2_ATT.value(1)
-    sleep(0.01)
+    def take_packet(self):
+        packet = self.pending_packet
+        self.pending_packet = None
+        return packet
 
 
-# ==========================================
-# 2. CAU HINH 4 DONG CO
-# ==========================================
+class ServoController:
+    """Điều khiển Servo chuẩn 50Hz trên ESP32 bằng xung PWM."""
 
-# Moi dong co dung 2 chan dieu khien
-# PWM tren IN1 hoac IN2 de dieu chinh toc do
+    def __init__(
+        self,
+        pin_num: int,
+        min_angle: int = 0,
+        max_angle: int = 180,
+        min_pulse_us: int = 500,
+        max_pulse_us: int = 2500,
+    ):
+        if max_angle <= min_angle:
+            raise ValueError("max_angle phải lớn hơn min_angle")
+        if max_pulse_us <= min_pulse_us:
+            raise ValueError("max_pulse_us phải lớn hơn min_pulse_us")
 
-class Motor:
+        self.pwm = PWM(Pin(pin_num), freq=50)
+        self.min_angle = min_angle
+        self.max_angle = max_angle
+        self.min_pulse_us = min_pulse_us
+        self.max_pulse_us = max_pulse_us
+        self.current_angle = self._clamp_angle(90)
+        self._write_angle(self.current_angle)
 
-    def __init__(self, pin1, pin2, reverse=False):
+    def _angle_to_duty(self, angle: float) -> int:
+        angle = self._clamp_angle(angle)
+        pulse_us = self.min_pulse_us + (
+            (angle - self.min_angle)
+            * (self.max_pulse_us - self.min_pulse_us)
+            / (self.max_angle - self.min_angle)
+        )
+        return int((pulse_us / 20000) * 1023)
 
-        self.pwm1 = PWM(Pin(pin1), freq=1000)
-        self.pwm2 = PWM(Pin(pin2), freq=1000)
+    def _clamp_angle(self, angle: float) -> float:
+        return max(self.min_angle, min(self.max_angle, angle))
 
-        self.reverse = reverse
+    def _write_angle(self, angle: float):
+        _write_pwm_duty(self.pwm, self._angle_to_duty(angle))
+
+    def set_angle(self, angle: float, smooth_delay: float = 0.015):
+        """Quay servo mượt về góc mong muốn."""
+        if smooth_delay < 0:
+            raise ValueError("smooth_delay không được âm")
+
+        target = self._clamp_angle(angle)
+        step = 2 if target >= self.current_angle else -2
+
+        for pos in range(int(self.current_angle), int(target), step):
+            self._write_angle(pos)
+            if smooth_delay:
+                time.sleep(smooth_delay)
+
+        self._write_angle(target)
+        self.current_angle = target
+
+
+class DCMotor:
+    """Điều khiển 1 động cơ DC qua 2 chân IN1, IN2 dùng PWM."""
+
+    def __init__(self, in1_pin: int, in2_pin: int, freq: int = 1000):
+        self.in1 = PWM(Pin(in1_pin), freq=freq)
+        self.in2 = PWM(Pin(in2_pin), freq=freq)
         self.stop()
 
-    def run(self, speed):
-
-        speed = max(-100, min(100, speed))
-
-        if self.reverse:
-            speed = -speed
-
-        duty = int(abs(speed) * 65535 / 100)
-
+    def set_speed(self, speed: int):
+        """speed nằm trong khoảng [-1023, 1023]: dương = tới, âm = lùi, 0 = dừng."""
+        speed = max(-1023, min(1023, int(speed)))
         if speed > 0:
-            self.pwm1.duty_u16(duty)
-            self.pwm2.duty_u16(0)
-
+            _write_pwm_duty(self.in2, 0)
+            _write_pwm_duty(self.in1, speed)
         elif speed < 0:
-            self.pwm1.duty_u16(0)
-            self.pwm2.duty_u16(duty)
-
+            _write_pwm_duty(self.in1, 0)
+            _write_pwm_duty(self.in2, abs(speed))
         else:
             self.stop()
 
     def stop(self):
-        self.pwm1.duty_u16(0)
-        self.pwm2.duty_u16(0)
+        _write_pwm_duty(self.in1, 0)
+        _write_pwm_duty(self.in2, 0)
 
 
-class ServoSG90:
+class NewmaniaV2:
+    """Bộ điều khiển trung tâm cho robot bánh Mecanum Newmania v2."""
+    #  điều chỉnh ở đây gồm lên /xuống và gắp/nhả :))
+    MAX_SPEED = 1023
+    SERVO_STEP_DEGREES = 2
+    SERVO_STEP_DELAY = 0.015
 
-    def __init__(self, pin):
-        self.pwm = PWM(Pin(pin), freq=50)
-        self.current_angle = None
+    def __init__(self):
+        # 4 bánh xe Mecanum: FL (Trước-Trái), FR (Trước-Phải), RL (Sau-Trái), RR (Sau-Phải)
+        self.fl = DCMotor(16, 17)
+        self.fr = DCMotor(18, 19)
+        self.rl = DCMotor(25, 26)
+        self.rr = DCMotor(27, 14)
 
-    def set_angle(self, angle):
-        angle = max(0, min(180, angle))
-        if angle == self.current_angle:
-            return
+        # 2 Servo: Servo 1 = Nâng/Hạ, Servo 2 = Gắp/Nhả
+        self.lift_servo = ServoController(pin_num=13)
+        self.grip_servo = ServoController(pin_num=15)
 
-        pulse_us = 500 + (angle * 2000 / 180)
-        duty = int(pulse_us * 65535 / 20000)
-        self.pwm.duty_u16(duty)
-        self.current_angle = angle
+        # Đèn pin
+        self.light = Pin(12, Pin.OUT)
+        self.light.value(0)
+
+        # Góc cấu hình cho cơ cấu nâng-hạ và gắp-nhả (tùy chỉnh theo cơ khí thực tế)
+        self.ANGLE_LIFT = 135
+        self.ANGLE_LOWER = 45
+        self.ANGLE_GRIP = 110
+        self.ANGLE_RELEASE = 35
+
+        self.reset_pose()
+
+    def _apply_wheels(self, fl: int, fr: int, rl: int, rr: int):
+        self.fl.set_speed(fl)
+        self.fr.set_speed(fr)
+        self.rl.set_speed(rl)
+        self.rr.set_speed(rr)
+
+    # --- CÁC CHƯƠNG TRÌNH DI CHUYỂN ---
+    def drive(
+        self,
+        forward: int = 0,
+        strafe: int = 0,
+        turn: int = 0,
+        duration: float = None,
+    ):
+        """Phối hợp tiến/lùi, ngang và xoay; mỗi trục nhận giá trị -1023..1023."""
+        if duration is not None and duration < 0:
+            raise ValueError("duration không được âm")
+
+        fl = forward - strafe - turn
+        fr = forward + strafe + turn
+        rl = forward + strafe - turn
+        rr = forward - strafe + turn
+        peak = max(abs(fl), abs(fr), abs(rl), abs(rr))
+        if peak > self.MAX_SPEED:
+            scale = self.MAX_SPEED / peak
+            fl = int(fl * scale)
+            fr = int(fr * scale)
+            rl = int(rl * scale)
+            rr = int(rr * scale)
+
+        self._apply_wheels(fl, fr, rl, rr)
+        if duration is not None:
+            time.sleep(duration)
+            self.stop()
+# chương trình di chuyển
+    def stop(self):
+        """Dừng toàn bộ bánh xe."""
+        self._apply_wheels(0, 0, 0, 0)
+
+    def move_forward(self, speed: int = 850, duration: float = None):
+        """Tiến thẳng."""
+        self.drive(forward=abs(speed), duration=duration)
+
+    def move_backward(self, speed: int = 850, duration: float = None):
+        """Lùi thẳng."""
+        self.drive(forward=-abs(speed), duration=duration)
+
+    def strafe_left(self, speed: int = 850, duration: float = None):
+        """Đi ngang sang trái (Mecanum)."""
+        self.drive(strafe=abs(speed), duration=duration)
+
+    def strafe_right(self, speed: int = 850, duration: float = None):
+        """Đi ngang sang phải (Mecanum)."""
+        self.drive(strafe=-abs(speed), duration=duration)
+
+    def _set_servo_angles_together(self, movements):
+        servos = []
+        for servo, angle in movements:
+            servos.append((servo, servo.current_angle, servo._clamp_angle(angle)))
+
+        max_delta = max(abs(target - start) for _, start, target in servos)
+        steps = int(max_delta / self.SERVO_STEP_DEGREES)
+        if steps * self.SERVO_STEP_DEGREES < max_delta:
+            steps += 1
+        for step in range(1, steps + 1):
+            for servo, start, target in servos:
+                angle = start + (target - start) * step / steps
+                servo._write_angle(angle)
+            if step < steps:
+                time.sleep(self.SERVO_STEP_DELAY)
+
+        for servo, _, target in servos:
+            servo.current_angle = target
+
+    # --- CÁC CHƯƠNG TRÌNH SERVO (NÂNG/HẠ & GẮP/NHẢ) ---
+    def lift(self):
+        """Nâng cơ cấu lên."""
+        self.lift_servo.set_angle(self.ANGLE_LIFT)
+
+    def lower(self):
+        """Hạ cơ cấu xuống."""
+        self.lift_servo.set_angle(self.ANGLE_LOWER)
+
+    def grip(self):
+        """Gắp vật."""
+        self.grip_servo.set_angle(self.ANGLE_GRIP)
+
+    def release(self):
+        """Nhả vật."""
+        self.grip_servo.set_angle(self.ANGLE_RELEASE)
+
+    def lift_and_grip(self):
+        """Chuỗi thao tác: Gắp vật -> Nâng lên."""
+        self.grip()
+        time.sleep(0.2)
+        self.lift()
+
+    def lower_and_release(self):
+        """Chuỗi thao tác: Hạ xuống -> Nhả vật."""
+        self.lower()
+        time.sleep(0.2)
+        self.release()
+
+    def reset_pose(self):
+        """Đưa 2 servo về trạng thái sẵn sàng (hạ thấp và mở kẹp)."""
+        self._set_servo_angles_together(
+            (
+                (self.lift_servo, self.ANGLE_LOWER),
+                (self.grip_servo, self.ANGLE_RELEASE),
+            )
+        )
+
+    def toggle_light(self):
+        """Bật/tắt đèn pin."""
+        self.light.value(not self.light.value())
 
 
-# ==========================================
-# 3. KHOI TAO 4 DONG CO
-# ==========================================
+def _apply_controller_buttons(robot, buttons, previous_buttons):
+    pressed = buttons & ~previous_buttons
 
-motor_FL = Motor(4, 5, False)   # Truoc trai
-motor_FR = Motor(6, 7, True)    # Truoc phai
-motor_RL = Motor(8, 9, False)   # Sau trai
-motor_RR = Motor(10, 11, True) # Sau phai
-servo_lift = ServoSG90(16)
-servo_gripper = ServoSG90(17)
+    if pressed & BUTTON_RESET:
+        robot.reset_pose()
+    elif pressed & BUTTON_PICK:
+        robot.lift_and_grip()
+    elif pressed & BUTTON_DROP:
+        robot.lower_and_release()
+    else:
+        if pressed & BUTTON_LIFT:
+            robot.lift()
+        elif pressed & BUTTON_LOWER:
+            robot.lower()
 
-LIFT_UP_ANGLE = 30
-LIFT_DOWN_ANGLE = 90
-GRIP_CLOSE_ANGLE = 30
-GRIP_OPEN_ANGLE = 90
+        if pressed & BUTTON_GRIP:
+            robot.grip()
+        elif pressed & BUTTON_RELEASE:
+            robot.release()
 
-
-def stop_all():
-    motor_FL.stop()
-    motor_FR.stop()
-    motor_RL.stop()
-    motor_RR.stop()
-
-
-# ==========================================
-# 4. DIEU KHIEN ROBOT
-# ==========================================
-
-MAX_SPEED = 70
-DEAD_ZONE = 15
-CONTROL_PERIOD = 0.01
+    if pressed & BUTTON_LIGHT:
+        robot.toggle_light()
 
 
-def deadzone(value):
-    if abs(value) < DEAD_ZONE / 128:
-        return 0
-    return value
-
-
-def joystick_value(value):
-    return (128 - value) / 128
-
-
-def robot_move(throttle, steering):
-
-    # Phoi hop tien lui va re trai phai
-    left = throttle + steering
-    right = throttle - steering
-
-    # Chuan hoa toc do
-    maximum = max(1, abs(left), abs(right))
-
-    left = left / maximum * MAX_SPEED
-    right = right / maximum * MAX_SPEED
-
-    motor_FL.run(left)
-    motor_RL.run(left)
-
-    motor_FR.run(right)
-    motor_RR.run(right)
-
-
-# ==========================================
-# 5. CHUONG TRINH CHINH
-# ==========================================
-
-print("ROBOT ESP32-S3 STARTING...")
-
-stop_all()
-sleep(1)
-
-print("DANG KHOI TAO TAY CAM PS2")
-
-ps2_config()
-
-print("SAN SANG DIEU KHIEN ROBOT")
-
-
-while True:
-
+def run_ble_robot():
+    print("BLE robot ready; advertising as", BLE_NAME)
+    robot = NewmaniaV2()
     try:
+        receiver = BLEControlServer()
+        previous_buttons = 0
+        motion = (0, 0, 0)
+        last_packet_ms = None
+        was_connected = False
 
-        data = ps2_read()
+        while True:
+            if receiver.connected != was_connected:
+                if receiver.connected:
+                    print("PS4 bridge connected")
+                else:
+                    print("PS4 bridge disconnected")
+                was_connected = receiver.connected
 
-        # Mat ket noi hoac khong doc duoc tay cam
-        if data is None:
-            stop_all()
-            sleep(0.1)
-            continue
+            packet = receiver.take_packet()
+            now = time.ticks_ms()
 
-        # Sau byte 0x5A, goi PS2 lan luot la nut thap, nut cao,
-        # analog phai X/Y, analog trai X/Y.
-        buttons_low = data[0]
-        buttons_high = data[1]
+            if packet is not None:
+                if len(packet) == PACKET_SIZE:
+                    magic, forward, strafe, turn, buttons = struct.unpack(
+                        PACKET_FORMAT, packet
+                    )
+                    if magic == PACKET_MAGIC:
+                        forward = max(-1023, min(1023, forward))
+                        strafe = max(-1023, min(1023, strafe))
+                        turn = max(-1023, min(1023, turn))
+                        motion = (forward, strafe, turn)
+                        _apply_controller_buttons(
+                            robot, buttons, previous_buttons
+                        )
+                        previous_buttons = buttons
+                        last_packet_ms = now
+                    else:
+                        print("Ignoring invalid BLE packet magic")
+                else:
+                    print("Ignoring invalid BLE packet length")
 
-        left_x = data[4]
-        left_y = data[5]
+            if (
+                last_packet_ms is None
+                or time.ticks_diff(now, last_packet_ms) > CONTROL_TIMEOUT_MS
+            ):
+                motion = (0, 0, 0)
+                previous_buttons = 0
+                last_packet_ms = None
+                robot.stop()
+            else:
+                robot.drive(*motion)
 
-        # Nut START: Dung khan cap
-        if not (buttons_low & (1 << 3)):
-            stop_all()
-            sleep(0.05)
-            continue
+            time.sleep_ms(20)
+    finally:
+        robot.stop()
+                                        
 
-        # Dieu khien bang can analog trai
-        throttle = joystick_value(left_y)
-        steering = (left_x - 128) / 128
-
-        throttle = deadzone(throttle)
-        steering = deadzone(steering)
-
-        # Dieu khien bang phim mui ten neu can analog o giua
-        if abs(throttle) < 0.01 and abs(steering) < 0.01:
-
-            if not (buttons_low & (1 << 4)):
-                throttle = 1
-
-            elif not (buttons_low & (1 << 6)):
-                throttle = -1
-
-            if not (buttons_low & (1 << 7)):
-                steering = -1
-
-            elif not (buttons_low & (1 << 5)):
-                steering = 1
-
-        # Nut X: Tang toc
-        if not (buttons_high & (1 << 6)):
-            MAX_SPEED = 100
-
-        # Nut O: Giam toc
-        elif not (buttons_high & (1 << 5)):
-            MAX_SPEED = 40
-
+if __name__ == "__main__":
+    if HARDWARE_AVAILABLE:
+        run_ble_robot()
+    else:
+        if sys.implementation.name == "micropython":
+            print(
+                "Firmware hiện tại không phải ESP32. "
+                "Hãy nạp MicroPython dành cho ESP32-S3 rồi chạy lại."
+            )
         else:
-            MAX_SPEED = 70
-
-        robot_move(throttle, steering)
-
-        # R1/R2 dieu khien nang-ha; L1/L2 dieu khien gap-nha.
-        lift_up = not (buttons_high & (1 << 3))
-        lift_down = not (buttons_high & (1 << 1))
-        grip_close = not (buttons_high & (1 << 2))
-        grip_open = not (buttons_high & (1 << 0))
-
-        if lift_up != lift_down:
-            servo_lift.set_angle(
-                LIFT_UP_ANGLE if lift_up else LIFT_DOWN_ANGLE
+            print(
+                "Đây là firmware chạy trên ESP32, không chạy trực tiếp bằng Python "
+                "trên máy tính. Hãy kết nối ESP32 bằng cáp USB dữ liệu và chạy "
+                "tác vụ VS Code 'Robot: upload and run (MicroPython)'."
             )
 
-        if grip_close != grip_open:
-            servo_gripper.set_angle(
-                GRIP_CLOSE_ANGLE if grip_close else GRIP_OPEN_ANGLE
-            )
-
-        sleep(CONTROL_PERIOD)
-
-    except Exception as error:
-
-        print("LOI:", error)
-
-        stop_all()
-        sleep(0.2)
+            
